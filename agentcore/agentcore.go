@@ -127,6 +127,11 @@ type Options struct {
 	DeepSeekSearchBaseURL string
 	DeepSeekSearchAPIKey  string
 	DeepSeekSearchModel   string
+	// QwenSearch* configure the "qwen-search" backend: DashScope's built-in web
+	// search, billed and authenticated like a normal chat call.
+	QwenSearchBaseURL string
+	QwenSearchAPIKey  string
+	QwenSearchModel   string
 	// WebSearchProxy, when set, routes web_search requests through this http(s)
 	// proxy URL — useful when the search endpoint is only reachable via a proxy.
 	WebSearchProxy string
@@ -297,7 +302,7 @@ func NewSession(opts Options) *Session {
 		// missing) drops the tool rather than failing the whole session — the
 		// rest of the agent stays usable — but the host is told, so a missing
 		// web_search is never silent.
-		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
+		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, QwenBaseURL: opts.QwenSearchBaseURL, QwenAPIKey: opts.QwenSearchAPIKey, QwenModel: opts.QwenSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
 			tools = append(tools, ws)
 		} else {
 			s.warn("web_search is enabled but unavailable: " + err.Error())

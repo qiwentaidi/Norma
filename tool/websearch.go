@@ -60,6 +60,13 @@ type WebSearchConfig struct {
 	// DeepSeekModel is only used by "deepseek", which runs one model inference per
 	// search. "deepseek-search" ignores it: the Search API is model-independent.
 	DeepSeekModel string
+	// QwenAPIKey / QwenBaseURL / QwenModel configure "qwen-search", which turns on
+	// DashScope's built-in web search (enable_search) on a normal chat completion.
+	// The hits come back as search_info.search_results, so the search is billed and
+	// authenticated exactly like the chat call — no second credential.
+	QwenAPIKey  string
+	QwenBaseURL string
+	QwenModel   string
 	// Proxy, when set, routes search requests through this http(s) proxy URL —
 	// useful when the search endpoint is only reachable via a proxy. Empty = direct.
 	Proxy string
@@ -138,6 +145,17 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 			return nil, err
 		}
 		return &deepseekSearchProvider{apiKey: key, client: client, endpoint: endpoint}, nil
+	case "qwen-search":
+		key := strings.TrimSpace(cfg.QwenAPIKey)
+		if key == "" {
+			return nil, fmt.Errorf("web_search: backend %q requires a DashScope (Qwen) API key", backend)
+		}
+		return &qwenSearchProvider{
+			apiKey:   key,
+			model:    firstNonEmpty(cfg.QwenModel, qwenSearchDefaultModel),
+			client:   client,
+			endpoint: qwenSearchURL(cfg.QwenBaseURL),
+		}, nil
 	case "deepseek":
 		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
 		if key == "" {
@@ -153,7 +171,7 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		}
 		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
 	default:
-		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", \"deepseek-search\", or \"deepseek\")", backend)
+		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", \"deepseek-search\", \"qwen-search\", or \"deepseek\")", backend)
 	}
 }
 
@@ -443,6 +461,118 @@ func (p *tavilyProvider) Search(ctx context.Context, query string, limit int) ([
 			Title:       r.Title,
 			URL:         r.URL,
 			Description: r.Content,
+			Position:    len(out) + 1,
+		})
+	}
+	return out, nil
+}
+
+// ─── Qwen / DashScope (qwen-search) ────────────────────────────────────────
+// DashScope's OpenAI-compatible chat endpoint can run the search server-side:
+// enable_search=true makes the model search before answering, and the response
+// carries the hits in search_info.search_results. That keeps search on the same
+// key, quota and bill as the chat call — no second credential. A gateway that
+// strips the non-standard enable_search field returns no search_info at all; that
+// is reported as an error instead of being mistaken for "no results".
+
+const (
+	qwenSearchDefaultBase  = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	qwenSearchDefaultModel = "qwen-plus"
+)
+
+// qwenSearchURL normalizes a profile base URL to the chat-completions endpoint.
+func qwenSearchURL(base string) string {
+	b := strings.TrimRight(strings.TrimSpace(base), "/")
+	if b == "" {
+		b = qwenSearchDefaultBase
+	}
+	if strings.HasSuffix(b, "/chat/completions") {
+		return b
+	}
+	if !strings.HasSuffix(b, "/v1") {
+		b += "/v1"
+	}
+	return b + "/chat/completions"
+}
+
+type qwenSearchProvider struct {
+	apiKey   string
+	model    string
+	client   *http.Client
+	endpoint string
+}
+
+func (p *qwenSearchProvider) Name() string { return "qwen-search" }
+
+func (p *qwenSearchProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("query must not be empty")
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":          p.model,
+		"messages":       []map[string]string{{"role": "user", "content": query}},
+		"enable_search":  true,
+		"search_options": map[string]any{"forced_search": true, "enable_source": true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	if resp.StatusCode != http.StatusOK {
+		msg := truncate(strings.TrimSpace(string(raw)), 300)
+		if resp.StatusCode == http.StatusPaymentRequired {
+			return nil, fmt.Errorf("Qwen search: insufficient account balance (HTTP 402): %s", msg)
+		}
+		return nil, fmt.Errorf("Qwen search returned HTTP %d: %s", resp.StatusCode, msg)
+	}
+	var payload struct {
+		SearchInfo *struct {
+			SearchResults []struct {
+				Title   string `json:"title"`
+				URL     string `json:"url"`
+				Link    string `json:"link"`
+				Snippet string `json:"snippet"`
+				Content string `json:"content"`
+			} `json:"search_results"`
+		} `json:"search_info"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("could not parse Qwen search response: %w", err)
+	}
+	if payload.Error != nil && payload.Error.Message != "" {
+		return nil, fmt.Errorf("Qwen search error: %s", payload.Error.Message)
+	}
+	if payload.SearchInfo == nil {
+		return nil, fmt.Errorf("Qwen returned no search_info: the endpoint did not run web search (enable_search may be stripped by the gateway)")
+	}
+	var out []SearchResult
+	for _, r := range payload.SearchInfo.SearchResults {
+		if len(out) >= limit {
+			break
+		}
+		href := firstNonEmpty(r.URL, r.Link)
+		if strings.TrimSpace(href) == "" {
+			continue
+		}
+		out = append(out, SearchResult{
+			Title:       firstNonEmpty(r.Title, hostOf(href)),
+			URL:         href,
+			Description: firstNonEmpty(r.Snippet, r.Content),
 			Position:    len(out) + 1,
 		})
 	}

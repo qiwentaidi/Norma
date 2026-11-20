@@ -391,3 +391,80 @@ func TestDeepSeekSearchRejectsBadQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestQwenSearchConfig(t *testing.T) {
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "qwen-search"}); err == nil {
+		t.Fatal("qwen-search without a key should error")
+	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "qwen-search", QwenAPIKey: "k"}); err != nil {
+		t.Fatalf("qwen-search with a key should build: %v", err)
+	}
+}
+
+func TestQwenSearchURL(t *testing.T) {
+	cases := map[string]string{
+		"": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+		"https://dashscope.aliyuncs.com/compatible-mode/v1":  "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+		"https://dashscope.aliyuncs.com/compatible-mode/v1/": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+		"https://gw.example.com/v1":                          "https://gw.example.com/v1/chat/completions",
+		"https://gw.example.com/v1/chat/completions":         "https://gw.example.com/v1/chat/completions",
+	}
+	for in, want := range cases {
+		if got := qwenSearchURL(in); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestQwenSearchParse(t *testing.T) {
+	var got struct {
+		EnableSearch bool   `json:"enable_search"`
+		Model        string `json:"model"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer secret" {
+			t.Errorf("bad auth header: %q", auth)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"search_info":{"search_results":[
+			{"title":"A","url":"https://a.example","snippet":"s1"},
+			{"title":"","link":"https://b.example","content":"s2"},
+			{"title":"no url","url":""}
+		]}}`))
+	}))
+	defer srv.Close()
+
+	p := &qwenSearchProvider{apiKey: "secret", model: "qwen-plus", client: srv.Client(), endpoint: srv.URL + "/v1/chat/completions"}
+	res, err := p.Search(context.Background(), "site:example.com 测试", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if !got.EnableSearch || got.Model != "qwen-plus" {
+		t.Errorf("request must carry enable_search and the model: %+v", got)
+	}
+	if len(res) != 2 {
+		t.Fatalf("want 2 usable results, got %d: %+v", len(res), res)
+	}
+	if res[0].Description != "s1" || res[0].Title != "A" {
+		t.Errorf("bad first result: %+v", res[0])
+	}
+	if res[1].URL != "https://b.example" || res[1].Description != "s2" || res[1].Title != "b.example" {
+		t.Errorf("link/content fallbacks not applied: %+v", res[1])
+	}
+}
+
+func TestQwenSearchRequiresSearchInfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"plain answer without search"}}]}`))
+	}))
+	defer srv.Close()
+	p := &qwenSearchProvider{apiKey: "k", model: "qwen-plus", client: srv.Client(), endpoint: srv.URL}
+	if _, err := p.Search(context.Background(), "q", 3); err == nil || !strings.Contains(err.Error(), "search_info") {
+		t.Fatalf("a gateway that strips enable_search must be reported, got %v", err)
+	}
+}
