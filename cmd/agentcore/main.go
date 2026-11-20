@@ -28,15 +28,18 @@ const defaultSystem = `You are a helpful coding agent operating in a terminal. U
 
 func main() {
 	var (
-		providerName = flag.String("provider", env("AGENT_PROVIDER", "anthropic"), "anthropic | openai")
-		model        = flag.String("model", env("AGENT_MODEL", ""), "model id (e.g. claude-opus-4-8, gpt-4o)")
-		baseURL      = flag.String("base-url", "", "override API base URL")
-		apiKey       = flag.String("api-key", "", "API key (else ANTHROPIC_API_KEY / OPENAI_API_KEY)")
-		systemFile   = flag.String("system", "", "path to a system prompt file (else a built-in coding prompt)")
-		workDir      = flag.String("dir", "", "working directory for tools (default cwd)")
-		yes          = flag.Bool("yes", false, "auto-approve all tool calls (bypass permission)")
-		maxTurns     = flag.Int("max-turns", 50, "max model round-trips per message")
-		oneShot      = flag.String("p", "", "run a single prompt and exit")
+		providerName     = flag.String("provider", env("AGENT_PROVIDER", "anthropic"), "anthropic | openai")
+		model            = flag.String("model", env("AGENT_MODEL", ""), "model id (e.g. claude-opus-4-8, gpt-4o)")
+		baseURL          = flag.String("base-url", "", "override API base URL")
+		apiKey           = flag.String("api-key", "", "API key (else ANTHROPIC_API_KEY / OPENAI_API_KEY)")
+		systemFile       = flag.String("system", "", "path to a system prompt file (else a built-in coding prompt)")
+		workDir          = flag.String("dir", "", "working directory for tools (default cwd)")
+		yes              = flag.Bool("yes", false, "auto-approve all tool calls (bypass permission)")
+		maxTurns         = flag.Int("max-turns", 50, "max model round-trips per message")
+		oneShot          = flag.String("p", "", "run a single prompt and exit")
+		webSearch        = flag.Bool("websearch", envBool("AGENT_WEBSEARCH", true), "enable the network-facing web_search tool (permission-gated)")
+		webSearchBackend = flag.String("websearch-backend", env("AGENT_WEBSEARCH_BACKEND", "ddgs"), "ddgs | brave-free | tavily | deepseek-search | deepseek")
+		webSearchBase    = flag.String("websearch-base-url", env("AGENT_WEBSEARCH_BASE_URL", ""), "base URL for the DeepSeek search backends (default https://api.deepseek.com)")
 	)
 	flag.Parse()
 
@@ -75,13 +78,21 @@ func main() {
 	}
 
 	sess := agentcore.NewSession(agentcore.Options{
-		Provider:       prov,
-		SystemPrompt:   []string{system},
-		PermissionMode: mode,
-		CanUseTool:     askUser,
-		AskUser:        askUserQuestion,
-		WorkingDir:     wd,
-		MaxTurns:       *maxTurns,
+		Provider:              prov,
+		SystemPrompt:          []string{system},
+		PermissionMode:        mode,
+		CanUseTool:            askUser,
+		AskUser:               askUserQuestion,
+		WorkingDir:            wd,
+		MaxTurns:              *maxTurns,
+		EnableWebSearch:       *webSearch,
+		WebSearchBackend:      *webSearchBackend,
+		BraveSearchAPIKey:     os.Getenv("BRAVE_API_KEY"),
+		TavilySearchAPIKey:    os.Getenv("TAVILY_API_KEY"),
+		DeepSeekSearchAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekSearchBaseURL: *webSearchBase,
+		DeepSeekSearchModel:   env("DEEPSEEK_SEARCH_MODEL", *model),
+		OnWarn:                func(msg string) { fmt.Fprintln(os.Stderr, msg) },
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -191,6 +202,17 @@ func summarize(input json.RawMessage) string {
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return def
 }

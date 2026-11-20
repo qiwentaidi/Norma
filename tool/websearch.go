@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/norma/permission"
 	"golang.org/x/net/html"
@@ -35,8 +36,10 @@ type searchProvider interface {
 type WebSearchConfig struct {
 	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key),
 	// "brave-free" (Brave Search API, needs BraveAPIKey), "tavily" (Tavily
-	// Search API, needs TavilyAPIKey), or "deepseek" (DeepSeek's server-side
-	// web search, needs DeepSeek*). Empty defaults to "ddgs".
+	// Search API, needs TavilyAPIKey), "deepseek-search" (DeepSeek's standalone
+	// Search API — the preferred DeepSeek backend), or "deepseek" (DeepSeek's
+	// server-side web search, one model call per search; kept for compatibility).
+	// Empty defaults to "ddgs".
 	Backend string
 	// BraveAPIKey authenticates the "brave-free" backend. Required (and only
 	// used) when Backend == "brave-free".
@@ -44,16 +47,19 @@ type WebSearchConfig struct {
 	// TavilyAPIKey authenticates the "tavily" backend. Required (and only
 	// used) when Backend == "tavily".
 	TavilyAPIKey string
-	// DeepSeekBaseURL / DeepSeekAPIKey / DeepSeekModel configure the "deepseek"
-	// backend. That backend does NOT call a search API — DeepSeek has none.
-	// Search there only exists inside its Anthropic-compatible messages endpoint
-	// as the web_search_20250305 server tool, so this provider spends one model
-	// call per search. BaseURL must be the Anthropic-format root (the provider
-	// appends /v1/messages); the OpenAI-format endpoint rejects server tools
-	// outright ("unknown variant, expected `function`").
+	// DeepSeekAPIKey authenticates both DeepSeek backends.
+	DeepSeekAPIKey string
+	// DeepSeekBaseURL is the profile base URL. For "deepseek-search" it is
+	// optional (empty means https://api.deepseek.com) and may be the API root, a
+	// /v1 root, or the Anthropic-format /v1/messages root, so an existing DeepSeek
+	// profile can be reused as-is. For "deepseek" it is required and must be the
+	// Anthropic-format root (the provider appends /v1/messages); the OpenAI-format
+	// endpoint rejects server tools outright ("unknown variant, expected
+	// `function`").
 	DeepSeekBaseURL string
-	DeepSeekAPIKey  string
-	DeepSeekModel   string
+	// DeepSeekModel is only used by "deepseek", which runs one model inference per
+	// search. "deepseek-search" ignores it: the Search API is model-independent.
+	DeepSeekModel string
 	// Proxy, when set, routes search requests through this http(s) proxy URL —
 	// useful when the search endpoint is only reachable via a proxy. Empty = direct.
 	Proxy string
@@ -122,6 +128,16 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 			return nil, fmt.Errorf("web_search: backend %q requires a Tavily API key", backend)
 		}
 		return &tavilyProvider{apiKey: key, client: client, endpoint: tavilyEndpoint}, nil
+	case "deepseek-search":
+		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
+		if key == "" {
+			return nil, fmt.Errorf("web_search: backend %q requires a DeepSeek API key", backend)
+		}
+		endpoint, err := deepseekSearchURL(cfg.DeepSeekBaseURL)
+		if err != nil {
+			return nil, err
+		}
+		return &deepseekSearchProvider{apiKey: key, client: client, endpoint: endpoint}, nil
 	case "deepseek":
 		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
 		if key == "" {
@@ -137,7 +153,7 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		}
 		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
 	default:
-		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", or \"deepseek\")", backend)
+		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", \"deepseek-search\", or \"deepseek\")", backend)
 	}
 }
 
@@ -433,14 +449,153 @@ func (p *tavilyProvider) Search(ctx context.Context, query string, limit int) ([
 	return out, nil
 }
 
+// ─── DeepSeek Search API (deepseek-search) ──────────────────────────────────
+// DeepSeek's standalone Search API — POST /v1/tools/search with {query, count}.
+// It is a plain retrieval endpoint: no model inference, no chat protocol, so the
+// query reaches the engine verbatim (site:/lang:/after: … syntax included) and
+// every hit comes back with a summary. Billing is per successful non-empty
+// request and is independent of count. Prefer this backend: it is cheaper and
+// more predictable than the model-driven "deepseek" backend below.
+
+const (
+	deepseekSearchDefaultBase = "https://api.deepseek.com"
+	deepseekSearchMaxQuery    = 128 // query length in runes, per the API contract
+	deepseekSearchMaxCount    = 50  // results per request, per the API contract
+)
+
+// deepseekSearchURL normalizes a profile base URL to the Search endpoint. It
+// accepts the API root, a /v1 root, or the Anthropic-format /v1/messages root so
+// a gateway profile already configured for chat can be reused unchanged.
+func deepseekSearchURL(base string) (string, error) {
+	b := strings.TrimRight(strings.TrimSpace(base), "/")
+	for _, suffix := range []string{"/v1/messages", "/messages", "/v1"} {
+		if strings.HasSuffix(b, suffix) {
+			b = strings.TrimRight(strings.TrimSuffix(b, suffix), "/")
+			break
+		}
+	}
+	if b == "" {
+		b = deepseekSearchDefaultBase
+	}
+	u, err := url.Parse(b)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("deepseek-search: invalid base URL %q", base)
+	}
+	return b + "/v1/tools/search", nil
+}
+
+type deepseekSearchProvider struct {
+	apiKey   string
+	client   *http.Client
+	endpoint string
+}
+
+func (p *deepseekSearchProvider) Name() string { return "deepseek-search" }
+
+func (p *deepseekSearchProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	if n := utf8.RuneCountInString(query); n == 0 || n > deepseekSearchMaxQuery {
+		return nil, fmt.Errorf("query must be 1-%d characters (got %d)", deepseekSearchMaxQuery, n)
+	}
+	count := min(limit, deepseekSearchMaxCount)
+	if count < 1 {
+		count = 5
+	}
+	body, err := json.Marshal(map[string]any{"query": query, "count": count})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	if resp.StatusCode != http.StatusOK {
+		return nil, deepseekSearchError(resp.StatusCode, raw)
+	}
+	var payload struct {
+		Results []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Snippet string `json:"snippet"`
+			Summary string `json:"summary"`
+			Content string `json:"content"`
+		} `json:"results"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("could not parse DeepSeek Search response: %w", err)
+	}
+	if payload.Error != nil && payload.Error.Message != "" {
+		return nil, fmt.Errorf("DeepSeek Search error: %s", payload.Error.Message)
+	}
+	// An explicit empty results array is a successful search with no hits; a
+	// missing array is a malformed/error response and is caught above.
+	var out []SearchResult
+	for _, r := range payload.Results {
+		if len(out) >= limit {
+			break
+		}
+		if strings.TrimSpace(r.URL) == "" {
+			continue
+		}
+		out = append(out, SearchResult{
+			Title:       firstNonEmpty(r.Title, hostOf(r.URL)),
+			URL:         r.URL,
+			Description: firstNonEmpty(r.Summary, r.Snippet, r.Content),
+			Position:    len(out) + 1,
+		})
+	}
+	return out, nil
+}
+
+// deepseekSearchError turns an error body into a message that says what to do:
+// 402 means "recharge", 429 means "back off", 5xx means "retry".
+func deepseekSearchError(status int, raw []byte) error {
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &payload)
+	msg := strings.TrimSpace(payload.Error.Message)
+	if msg == "" {
+		msg = truncate(strings.TrimSpace(string(raw)), 300)
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("DeepSeek Search rejected the API key (HTTP 401): %s", msg)
+	case http.StatusPaymentRequired:
+		return fmt.Errorf("DeepSeek Search: insufficient account balance, recharge before retrying (HTTP 402): %s", msg)
+	case http.StatusBadRequest:
+		return fmt.Errorf("DeepSeek Search rejected the request (HTTP 400): %s", msg)
+	case http.StatusTooManyRequests:
+		return fmt.Errorf("DeepSeek Search is rate-limiting (HTTP 429): %s", msg)
+	}
+	if status >= 500 {
+		return fmt.Errorf("DeepSeek Search is unavailable (HTTP %d), retry later: %s", status, msg)
+	}
+	return fmt.Errorf("DeepSeek Search returned HTTP %d: %s", status, msg)
+}
+
 // ─── DeepSeek (server-side web search) ───────────────────────────────────────
-// Unlike every other backend here, DeepSeek exposes no search API to call. Its
-// search only exists inside the Anthropic-compatible messages endpoint as the
-// web_search_20250305 *server* tool: we declare the tool, DeepSeek's own model
-// decides to search, DeepSeek's servers run the search, and the hits come back
-// as web_search_tool_result blocks in the same response. So one search here
-// costs one model call, and the queries are chosen server-side rather than by
-// the caller (query below is a search *instruction*, not a literal term).
+// Legacy backend, kept for compatibility: it does not call the Search API, so one
+// search costs one model inference. DeepSeek's search only exists here inside the
+// Anthropic-compatible messages endpoint as the web_search_20250305 *server* tool:
+// we declare the tool, DeepSeek's own model decides to search, DeepSeek's servers
+// run the search, and the hits come back as web_search_tool_result blocks in the
+// same response. The queries are therefore chosen server-side rather than by the
+// caller (query below is a search *instruction*, not a literal term), which is
+// why "deepseek-search" is preferred.
 //
 // Streaming is mandatory, not a preference: DeepSeek's non-streaming response
 // embeds raw newlines inside JSON string literals, which encoding/json rejects

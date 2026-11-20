@@ -106,8 +106,10 @@ type Options struct {
 	// EnableWebSearch adds the network-facing web_search tool (permission-gated).
 	EnableWebSearch bool
 	// WebSearchBackend selects the search backend: "ddgs" (DuckDuckGo, no key),
-	// "brave-free" (Brave Search API), "tavily" (Tavily Search API), or
-	// "deepseek" (DeepSeek's server-side search). Empty defaults to "ddgs".
+	// "brave-free" (Brave Search API), "tavily" (Tavily Search API),
+	// "deepseek-search" (DeepSeek's standalone Search API — preferred), or
+	// "deepseek" (DeepSeek's server-side search, one model call per query).
+	// Empty defaults to "ddgs".
 	WebSearchBackend string
 	// BraveSearchAPIKey authenticates the "brave-free" backend. Required only when
 	// WebSearchBackend == "brave-free".
@@ -115,11 +117,13 @@ type Options struct {
 	// TavilySearchAPIKey authenticates the "tavily" backend. Required only when
 	// WebSearchBackend == "tavily".
 	TavilySearchAPIKey string
-	// DeepSeekSearch* configure the "deepseek" backend, which has no search API
-	// of its own: it spends one call on DeepSeek's Anthropic-format messages
-	// endpoint per search (the web_search_20250305 server tool). BaseURL must be
-	// the Anthropic-format root — DeepSeek's OpenAI-format endpoint rejects
-	// server tools. All three are required when WebSearchBackend == "deepseek".
+	// DeepSeekSearch* configure the DeepSeek backends. "deepseek-search" needs
+	// only DeepSeekSearchAPIKey; DeepSeekSearchBaseURL is optional (defaults to
+	// https://api.deepseek.com) and DeepSeekSearchModel is ignored. "deepseek"
+	// requires all three: it spends one model call on DeepSeek's Anthropic-format
+	// messages endpoint per search (the web_search_20250305 server tool), and the
+	// base URL must be the Anthropic-format root — DeepSeek's OpenAI-format
+	// endpoint rejects server tools.
 	DeepSeekSearchBaseURL string
 	DeepSeekSearchAPIKey  string
 	DeepSeekSearchModel   string
@@ -289,11 +293,14 @@ func NewSession(opts Options) *Session {
 		tools = append(tools, tool.NewWebFetch(tool.WebFetchConfig{Proxy: opts.WebFetchProxy, CACert: opts.WebFetchCACert, InsecureTLS: opts.WebFetchInsecureTLS}))
 	}
 	if opts.EnableWebSearch {
-		// A misconfigured backend (unknown name, or brave-free without a key)
-		// drops the tool rather than failing the whole session — the rest of the
-		// agent stays usable and the missing tool surfaces the misconfig.
+		// A misconfigured backend (unknown name, or a backend whose key is
+		// missing) drops the tool rather than failing the whole session — the
+		// rest of the agent stays usable — but the host is told, so a missing
+		// web_search is never silent.
 		if ws, err := tool.NewWebSearch(tool.WebSearchConfig{Backend: opts.WebSearchBackend, BraveAPIKey: opts.BraveSearchAPIKey, TavilyAPIKey: opts.TavilySearchAPIKey, DeepSeekBaseURL: opts.DeepSeekSearchBaseURL, DeepSeekAPIKey: opts.DeepSeekSearchAPIKey, DeepSeekModel: opts.DeepSeekSearchModel, Proxy: opts.WebSearchProxy, CACert: opts.WebSearchCACert, InsecureTLS: opts.WebSearchInsecureTLS}); err == nil {
 			tools = append(tools, ws)
+		} else {
+			s.warn("web_search is enabled but unavailable: " + err.Error())
 		}
 	}
 	if opts.Todos != nil {
